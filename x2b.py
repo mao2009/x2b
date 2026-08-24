@@ -44,11 +44,11 @@ USER_CACHE_DAYS = 7
 # プレフィックス分を考慮して余裕を持たせる
 MAX_TEXT_LENGTH = 270
 
-# Xリスト取得の最大件数（0で無制限）
-MAX_POSTS_PER_RUN = 200
-
-# twitter-cli 1回あたりの取得件数
-TWITTER_CLI_MAX = 100
+# Xリスト取得の最大件数（1 runあたりのハード上限）
+# twitter-cli listは1 runにつき1回だけ実行し、要求件数はこの値で固定する。
+# 明示的なpagination契約がないため複数回の取得は行わない
+# （docs/adr/0001-disable-pagination-for-x-list-fetching.md 参照）
+MAX_POSTS_PER_RUN = 100
 
 # リトライ設定
 MAX_RETRIES = 3
@@ -427,8 +427,16 @@ def get_x_user(screen_name, users, dry_run=False):
 
 def get_x_posts():
     """
-    Xリストから全投稿を取得（ページネーション対応）。
-    twitter-cliは-n/--maxで最大取得件数を指定可能。
+    Xリストから最新投稿を1ページ分だけ取得する。
+
+    twitter-cli list -n N には「次ページ」を保証するcursor/tokenがなく、
+    複数回呼び出すと同じ最新投稿を再取得して二重投稿する危険があるため、
+    paginationは禁止している。
+
+    - 1 runにつきtwitter-cli listは正確に1回だけ実行する
+    - 要求件数はMAX_POSTS_PER_RUN（=100）でハード上限とする
+
+    詳細は docs/adr/0001-disable-pagination-for-x-list-fetching.md を参照。
     """
     print("Fetching X list...")
 
@@ -439,64 +447,45 @@ def get_x_posts():
 
     env = os.environ.copy()
 
-    all_posts = []
-    max_posts = MAX_POSTS_PER_RUN if MAX_POSTS_PER_RUN > 0 else TWITTER_CLI_MAX * 10
-    remaining = max_posts
+    result = subprocess.run(
+        [
+            str(TWITTER_BIN),
+            "list",
+            LIST_ID,
+            "--json",
+            "-n", str(MAX_POSTS_PER_RUN),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
 
-    while remaining > 0:
-        fetch_count = min(TWITTER_CLI_MAX, remaining)
-
-        print(f"Fetching page (max {fetch_count} posts)...")
-
-        result = subprocess.run(
-            [
-                str(TWITTER_BIN),
-                "list",
-                LIST_ID,
-                "--json",
-                "-n", str(fetch_count),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
+    if result.returncode != 0:
+        print(
+            "twitter-cli error:",
+            file=sys.stderr
         )
+        print(
+            result.stderr,
+            file=sys.stderr
+        )
+        raise RuntimeError("twitter-cli failed")
 
-        if result.returncode != 0:
-            print(
-                "twitter-cli error:",
-                file=sys.stderr
-            )
-            print(
-                result.stderr,
-                file=sys.stderr
-            )
-            raise RuntimeError("twitter-cli failed")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(result.stdout[:2000], file=sys.stderr)
+        raise
 
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            print(result.stdout[:2000], file=sys.stderr)
-            raise
+    if not data.get("ok"):
+        raise RuntimeError("twitter-cli returned ok=false")
 
-        if not data.get("ok"):
-            raise RuntimeError("twitter-cli returned ok=false")
+    # twitter-cliが要求件数を超えて返しても
+    # runあたりのハード上限を守る (ADR 0001)
+    posts = data.get("data", [])[:MAX_POSTS_PER_RUN]
 
-        posts = data.get("data", [])
-        
-        if not posts:
-            print("No more posts.")
-            break
-
-        all_posts.extend(posts)
-        print(f"Fetched {len(posts)} posts (total: {len(all_posts)})")
-
-        if len(posts) < fetch_count:
-            break
-
-        remaining -= len(posts)
-
-    print(f"Total fetched: {len(all_posts)} posts")
-    return all_posts
+    print(f"Fetched {len(posts)} posts")
+    return posts
 
 
 # ============================================================

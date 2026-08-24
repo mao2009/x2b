@@ -20,6 +20,9 @@ cp .env.example .env   # BSKY_HANDLE / BSKY_APP_PASSWORD / X_LIST_ID を設定
 .venv/bin/python x2b.py --dry-run
 ```
 
+X posts are fetched once per run, with a maximum of 100 posts
+（X投稿は1回の実行につき1回だけ取得し、最大100件です）。
+
 ### Dry-runモード
 
 `--dry-run` を付けると、実際にはBlueskyへ何も投稿せず、
