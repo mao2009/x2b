@@ -70,6 +70,13 @@ def clear_dry_run_results():
     x2b.DRY_RUN_RESULTS.clear()
 
 
+@pytest.fixture(autouse=True)
+def isolate_state_file(tmp_path, monkeypatch):
+    """本番のseen.json / users.jsonへ絶対に触れないようにする。"""
+    monkeypatch.setattr(x2b, "STATE_FILE", tmp_path / "seen.json")
+    monkeypatch.setattr(x2b, "USERS_FILE", tmp_path / "users.json")
+
+
 @pytest.fixture
 def users():
     return {
