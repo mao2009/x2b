@@ -14,6 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from atproto import Client, models, client_utils
+from atproto_client import exceptions as atproto_exceptions
 
 try:
     import grapheme
@@ -832,8 +833,9 @@ def create_external_embed(
         except Exception as e:
 
             print(
-                f"Thumbnail upload failed: "
-                f"{e}"
+                f"Thumbnail processing failed "
+                f"(continuing without thumbnail): "
+                f"{format_error_for_log(e)}"
             )
 
     external = (
@@ -1099,13 +1101,408 @@ def build_post(
 # ============================================================
 
 class PermanentError(Exception):
-    """永続的なエラー（リトライしても解決しない）"""
+    """
+    恒久的なエラー（同じpayloadを再送しても解決しない既知の失敗）。
+
+    例:
+    - 送信前payload validation failure（本文長制限違反など）
+    - payload size violation（413 PayloadTooLargeなど）
+    - 既知の恒久的なAPI validation error
+    """
     pass
 
 
 class TransientError(Exception):
-    """一時的なエラー（リトライで解決する可能性がある）"""
+    """
+    一時的なエラー（時間を置いて再実行すれば成功する可能性がある）。
+
+    例:
+    - HTTP 429（レートリミット）
+    - HTTP 5xx（サーバー側の一時的障害）
+    - network failure / timeout / connection failure
+    """
     pass
+
+
+class UnknownError(Exception):
+    """
+    分類不能な予期しないエラー。
+
+    PermanentError / TransientErrorへ勝手に変換して握り潰さない。
+    - リトライはしない（同じ結果になる可能性が高く、原因調査が必要）
+    - seenには登録しない（次回実行時に再表面化し、ログで追跡できる）
+    """
+    pass
+
+
+# Bluesky APIが恒久的なpayload問題を示すと判明しているシグナル。
+#
+# XRPCエラーの`error`フィールドは"InvalidRequest"など粗い識別子しか
+# 持たないため、既知の恒久原因の判定だけはAPI返却message内容を
+# 参照する（優先順位ルール上の最終手段。SDK例外型とstatus_codeの
+# 構造化情報を先に使う）。語録は保守的に最小限に留め、拡張は慎重に。
+
+# 実際に確認されている恒久エラー識別子（小文字比較）
+PERMANENT_PAYLOAD_ERROR_IDS = frozenset({
+    "payloadtoolarge",  # blob等のサイズ超過（HTTP 400/413で返る）
+})
+
+PERMANENT_PAYLOAD_MESSAGE_KEYWORDS = (
+    "text too long",   # 本文長制限違反
+    "grapheme",        # Blueskyはグラフェム数で本文長を検証する
+    "too large",       # サイズ超過一般
+)
+
+
+def _extract_api_error_info(e):
+    """
+    atproto SDK例外から構造化情報を取り出す。
+
+    Returns:
+        (status_code, error_id, message) のタプル。
+        構造化情報を持たない例外の場合は None。
+    """
+    response = getattr(e, "response", None)
+
+    if response is None:
+        return None
+
+    status_code = getattr(response, "status_code", None)
+
+    error_id = None
+    message = None
+
+    # SDKはJSON bodyをXrpcErrorモデルへパース済み。
+    # （atproto_client.request._handle_response参照）
+    content = getattr(response, "content", None)
+
+    if content is not None:
+        error_id = getattr(content, "error", None)
+        message = getattr(content, "message", None)
+
+        if error_id is None and isinstance(content, dict):
+            error_id = content.get("error")
+            message = content.get("message")
+
+    return (status_code, error_id, message)
+
+
+def _is_known_permanent_payload_error(error_id, message):
+    """既知の恒久的payloadエラーかを判定する。"""
+    if error_id and error_id.lower() in PERMANENT_PAYLOAD_ERROR_IDS:
+        return True
+
+    if message:
+        lowered = message.lower()
+
+        if any(keyword in lowered for keyword in PERMANENT_PAYLOAD_MESSAGE_KEYWORDS):
+            return True
+
+    return False
+
+
+def format_error_for_log(e):
+    """
+    例外を調査可能な1行ログへ整形する。
+
+    記録する要素: 例外型名 / HTTP status / API error identifier /
+    API error message（切り詰め）/ 例外メッセージ。
+
+    認証情報（access token / app password / headers等）は
+    構造化情報から意図的に除外しており、ログに出力されない。
+    """
+    parts = [type(e).__name__]
+
+    info = _extract_api_error_info(e)
+
+    if info is not None:
+        status_code, error_id, message = info
+
+        parts.append(f"status={status_code}")
+
+        if error_id:
+            parts.append(f"api_error={error_id}")
+
+        if message:
+            parts.append(f"api_message={str(message)[:200]}")
+    else:
+        detail = str(e).strip()
+
+        if detail:
+            parts.append(str(e)[:200])
+
+    return " | ".join(parts)
+
+
+def classify_error(e):
+    """
+    エラーを Permanent / Transient / Unknown に分類する。
+
+    優先順位:
+    1. 既に分類済みの例外（送信前validation等）はそのまま透過
+    2. atproto SDKの例外型 + 構造化されたstatus_code / error識別子
+    3. 自前ネットワーク処理（OGP・thumbnail取得）の例外型
+    4. それ以外はUnknownError（握り潰さない）
+
+    分類ポリシー:
+    - 429, 5xx, transport timeout/network → TransientError
+    - 400/413 のうち既知のpayload validation問題 → PermanentError
+    - 未知の400 → UnknownError（勝手にPermanent扱いしない）
+    - 401/403等のその他4xx → UnknownError（認証情報の見直しが必要）
+    - 上記以外 → UnknownError
+
+    注意: SDK v0.0.71は502をNetworkErrorとして上げるため、
+    response付きの例外は例外型よりstatus_codeを優先して判断する。
+    """
+    # ---- 再分類防止: 送信前validation等で確定済みの分類は正とする ----
+    if isinstance(e, (PermanentError, TransientError, UnknownError)):
+        return e
+
+    # ---- atproto SDKの例外（構造化情報あり）----
+    if isinstance(e, atproto_exceptions.AtProtocolError):
+        info = _extract_api_error_info(e)
+
+        status_code = info[0] if info else None
+        error_id = info[1] if info else None
+        message = info[2] if info else None
+
+        if status_code is not None:
+            if status_code == 429 or (
+                500 <= status_code < 600
+            ):
+                return TransientError(
+                    f"Bluesky API temporarily unavailable "
+                    f"(HTTP {status_code}): {error_id}"
+                )
+
+            if status_code in (400, 413):
+                if _is_known_permanent_payload_error(
+                    error_id,
+                    message,
+                ):
+                    return PermanentError(
+                        f"Bluesky rejected the payload permanently "
+                        f"(HTTP {status_code}, {error_id}): {message}"
+                    )
+
+                if status_code == 413:
+                    # payloadが大きすぎる問題は再送でも解決しない
+                    return PermanentError(
+                        f"Payload too large "
+                        f"(HTTP {status_code}, {error_id}): {message}"
+                    )
+
+                # 内容を確認できない400をPermanent扱いにすると
+                # 投稿が黙って失われるためUnknownとして調査対象にする
+                return UnknownError(
+                    f"Unrecognized client error from Bluesky API "
+                    f"(HTTP {status_code}, {error_id}): {message}"
+                )
+
+            # 401/403（認証情報の問題）等、単一postの再試行では
+            # 解決しないためUnknownとして扱う
+            return UnknownError(
+                f"Unexpected API response from Bluesky "
+                f"(HTTP {status_code}, {error_id}): {message}"
+            )
+
+        # responseなし = トランスポート層の失敗
+        if isinstance(
+            e,
+            (atproto_exceptions.InvokeTimeoutError,
+             atproto_exceptions.NetworkError),
+        ):
+            return TransientError(
+                f"Network failure while calling Bluesky API: "
+                f"{format_error_for_log(e)}"
+            )
+
+        return UnknownError(
+            f"Unexpected atproto client error: "
+            f"{format_error_for_log(e)}"
+        )
+
+    # ---- 自前のネットワーク処理（OGP取得・thumbnail DL等）----
+    if isinstance(
+        e,
+        (requests.RequestException, ConnectionError, TimeoutError),
+    ):
+        return TransientError(
+            f"Network error: {format_error_for_log(e)}"
+        )
+
+    # ---- 分類不能 ----
+    return UnknownError(
+        f"Unclassified exception: {format_error_for_log(e)}"
+    )
+
+
+def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
+    """
+    リトライ付きでBlueskyに投稿する。
+
+    - PermanentError: リトライせず即raise
+      （同じpayloadの再送では解決しないため）
+    - UnknownError:   リトライせず即raise
+      （原因不明のため調査が必要。seenには入らないため
+       次回実行時に再表面化する）
+    - TransientError: 指数バックオフで最大max_retries回リトライし、
+      尽きたらTransientErrorのままraise（有限回で必ず終了する）
+
+    ログにはX post ID・例外型・HTTP status・API error識別子を含める。
+    """
+    post_id = (
+        str(post.get("id"))
+        if isinstance(post, dict)
+        else None
+    )
+
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+
+        try:
+            return _post_to_bluesky(client, post, users)
+
+        except Exception as e:
+
+            classified = classify_error(e)
+            detail = format_error_for_log(e)
+
+            if isinstance(classified, PermanentError):
+                print(
+                    f"PERMANENT ERROR "
+                    f"(not retrying) "
+                    f"X post ID: {post_id} | "
+                    f"{detail}",
+                    file=sys.stderr,
+                )
+                raise classified
+
+            if isinstance(classified, UnknownError):
+                print(
+                    f"UNKNOWN ERROR "
+                    f"(not retrying, requires investigation) "
+                    f"X post ID: {post_id} | "
+                    f"{detail}",
+                    file=sys.stderr,
+                )
+                raise classified
+
+            last_error = classified
+
+            if attempt < max_retries:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)  # 指数バックオフ
+                print(
+                    f"TRANSIENT ERROR "
+                    f"(attempt {attempt + 1}/{max_retries + 1}) "
+                    f"X post ID: {post_id} | "
+                    f"{detail}"
+                )
+                print(
+                    f"Retrying in {delay} seconds..."
+                )
+                time.sleep(delay)
+            else:
+                print(
+                    f"TRANSIENT ERROR "
+                    f"(retry exhausted after {attempt + 1} attempts) "
+                    f"X post ID: {post_id} | "
+                    f"{detail}"
+                )
+
+    raise last_error
+
+
+# ============================================================
+# seen状態と投稿結果の処理
+# ============================================================
+
+def mark_seen(seen, post_id):
+    """seenを更新して永続化する。"""
+    seen.add(post_id)
+    save_seen(seen)
+
+
+def process_single_post(client, post, users, seen):
+    """
+    1件のX投稿をBlueskyへ投稿し、結果に応じてseenを更新する。
+
+    戻り値（結果種別）とseenの扱い:
+
+    - "success":     投稿成功 → seen登録
+    - "permanent":   既知の恒久的失敗 → seen登録
+                     （毎回同じ失敗を永久に再処理しないため。
+                      失敗事実はstderrとサマリに可視化され、
+                      黙って消えることはない）
+    - "transient":   一時的失敗（リトライ上限到達含む）→ seen未登録
+                     （次回実行時に自動的に再試行される）
+    - "unknown":     分類不能な予期しない失敗 → seen未登録
+                     （原因調査が完了するまで次回実行で
+                      再表面化させ、黙って消えないようにする）
+    - "no_response": 投稿APIがfalsyな応答を返した
+                     （従来実装と同様、seenにも計上にも入れない）
+    """
+    post_id = str(post["id"])
+
+    try:
+        response = post_with_retry(client, post, users)
+
+        if response:
+
+            print(
+                "Posted:"
+            )
+
+            print(
+                response.uri
+            )
+
+            # 成功した場合のみ既読
+            mark_seen(seen, post_id)
+
+            return "success"
+
+        return "no_response"
+
+    except PermanentError as e:
+
+        print(
+            f"PERMANENT FAILURE "
+            f"(will not retry; marked as seen): "
+            f"X post ID: {post_id} | "
+            f"{format_error_for_log(e)}",
+            file=sys.stderr,
+        )
+
+        # 既知の恒久的失敗は次回も同じ結果になるため
+        # seenに追加して毎回の再処理・再通知を防ぐ
+        # （失敗事実はstderrログとサマリ計上で可視化される）
+        mark_seen(seen, post_id)
+
+        return "permanent"
+
+    except TransientError as e:
+
+        print(
+            f"TRANSIENT FAILURE "
+            f"(will retry next run): "
+            f"X post ID: {post_id} | "
+            f"{format_error_for_log(e)}",
+            file=sys.stderr,
+        )
+        return "transient"
+
+    except UnknownError as e:
+
+        print(
+            f"UNKNOWN FAILURE "
+            f"(kept out of seen; will resurface next run): "
+            f"X post ID: {post_id} | "
+            f"{format_error_for_log(e)}",
+            file=sys.stderr,
+        )
+        return "unknown"
 
 
 def validate_post_text(text):
@@ -1122,82 +1519,6 @@ def validate_post_text(text):
             f"Post text too long: {length} graphemes "
             f"(max {BSKY_MAX_TEXT_GRAPHEMES})"
         )
-
-
-def classify_error(e):
-    """
-    エラーを永続的/一時的に分類。
-    - 400: PermanentError（不正なリクエスト）
-    - 429: TransientError（レートリミット）
-    - 5xx: TransientError（サーバーエラー）
-    - ネットワークエラー: TransientError
-    - その他: TransientError（安全側）
-    """
-    # 送信前バリデーション等で
-    # 既に分類済みのエラーはそのまま透過させる
-    # （PermanentErrorがTransientErrorに包まれて
-    #   無限リトライされるのを防ぐ）
-    if isinstance(e, PermanentError):
-        return e
-
-    if isinstance(e, TransientError):
-        return e
-
-    error_str = str(e)
-    
-    # atprotoのエラーレスポンスからステータスコードを抽出
-    if "status_code=400" in error_str or "status_code=400" in error_str:
-        return PermanentError(f"Bad request (400): {e}")
-    
-    if "status_code=429" in error_str:
-        return TransientError(f"Rate limited (429): {e}")
-    
-    if "status_code=5" in error_str and len(error_str.split("status_code=")) > 1:
-        try:
-            code_part = error_str.split("status_code=")[1]
-            status_code = int(code_part[:3])
-            if 500 <= status_code < 600:
-                return TransientError(f"Server error ({status_code}): {e}")
-        except (ValueError, IndexError):
-            pass
-    
-    # ネットワーク系エラー
-    if isinstance(e, (requests.RequestException, ConnectionError, TimeoutError)):
-        return TransientError(f"Network error: {e}")
-    
-    # その他は一時的エラーとして扱う（安全側）
-    return TransientError(f"Unknown error: {e}")
-
-
-def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
-    """
-    リトライ付きでBlueskyに投稿。
-    一時的エラーは指数バックオフでリトライ。
-    永続的エラーは即座にraise。
-    """
-    last_error = None
-    
-    for attempt in range(max_retries + 1):
-        try:
-            return _post_to_bluesky(client, post, users)
-        except Exception as e:
-            classified = classify_error(e)
-            
-            if isinstance(classified, PermanentError):
-                print(f"PERMANENT ERROR (not retrying): {classified}")
-                raise classified
-            
-            last_error = classified
-            
-            if attempt < max_retries:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)  # 指数バックオフ
-                print(f"TRANSIENT ERROR (attempt {attempt + 1}/{max_retries + 1}): {classified}")
-                print(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                print(f"TRANSIENT ERROR (max retries exceeded): {classified}")
-    
-    raise last_error
 
 
 # ============================================================
@@ -1405,6 +1726,7 @@ def main():
         success_count = 0
         permanent_fail_count = 0
         transient_fail_count = 0
+        unknown_fail_count = 0
 
         for index, post in enumerate(
             new_posts
@@ -1469,54 +1791,21 @@ def main():
                 f"X post ID: {post_id}"
             )
 
-            try:
+            outcome = process_single_post(
+                client,
+                post,
+                users,
+                seen
+            )
 
-                response = post_with_retry(
-                    client,
-                    post,
-                    users
-                )
-
-                if response:
-
-                    print(
-                        "Posted:"
-                    )
-
-                    print(
-                        response.uri
-                    )
-
-                    # 成功した場合のみ既読
-                    seen.add(
-                        post_id
-                    )
-
-                    save_seen(
-                        seen
-                    )
-                    success_count += 1
-
-            except PermanentError as e:
-
-                print(
-                    f"PERMANENT FAILURE (will not retry): {e}",
-                    file=sys.stderr
-                )
+            if outcome == "success":
+                success_count += 1
+            elif outcome == "permanent":
                 permanent_fail_count += 1
-                # 永続的エラーの場合はseenに追加して次回スキップ
-                # （同じエラーで永遠にリトライしないため）
-                seen.add(post_id)
-                save_seen(seen)
-
-            except TransientError as e:
-
-                print(
-                    f"TRANSIENT FAILURE (will retry next run): {e}",
-                    file=sys.stderr
-                )
+            elif outcome == "transient":
                 transient_fail_count += 1
-                # 一時的エラーはseenに入れない（次回リトライ）
+            elif outcome == "unknown":
+                unknown_fail_count += 1
 
             # ----------------------------------------------------
             # 次の投稿まで3秒
@@ -1540,7 +1829,8 @@ def main():
         print(
             f"Summary: Success: {success_count}, "
             f"Permanent failures: {permanent_fail_count}, "
-            f"Transient failures: {transient_fail_count}"
+            f"Transient failures: {transient_fail_count}, "
+            f"Unknown failures: {unknown_fail_count}"
         )
         print(
             "Done."
