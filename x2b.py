@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import fcntl
 import json
 import os
@@ -293,12 +294,15 @@ def cache_is_fresh(entry):
         return False
 
 
-def get_x_user(screen_name, users):
+def get_x_user(screen_name, users, dry_run=False):
     """
     Xユーザー情報を取得。
 
     7日以内ならキャッシュを使用。
     7日を超えていればtwitter userで再取得。
+
+    Dry-run時は取得結果をメモリ上のキャッシュにのみ反映し、
+    users.jsonへの永続化は行わない（副作用なしで解析するため）。
     """
 
     if not screen_name:
@@ -410,7 +414,9 @@ def get_x_user(screen_name, users):
     }
 
     users[key] = entry
-    save_users(users)
+
+    if not dry_run:
+        save_users(users)
 
     return entry
 
@@ -783,45 +789,102 @@ def add_text_with_facets(
 # Bluesky用OGPカード
 # ============================================================
 
+def download_thumbnail(thumbnail_url):
+    """
+    サムネイル画像をダウンロードし、Blueskyのサイズ制限を検証する。
+
+    戻り値は (content, status) のタプル:
+
+    - content: 画像bytes（取得できない場合はNone）
+    - status:  "ok" | "too_large" | "failed" | "none"
+
+    サイズ超過・取得失敗時も例外を上げない
+    （サムネイルなしで投稿を継続する既存ポリシー）。
+
+    この関数は読み込みのみを行い、Blueskyへの書き込みは発生しないため、
+    Dry-runでもそのまま実行できる。
+    """
+    if not thumbnail_url:
+        return None, "none"
+
+    print(
+        f"Downloading thumbnail: "
+        f"{thumbnail_url}"
+    )
+
+    try:
+
+        response = requests.get(
+            thumbnail_url,
+            headers={
+                "User-Agent": USER_AGENT
+            },
+            timeout=20,
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as e:
+
+        print(
+            f"Thumbnail processing failed "
+            f"(continuing without thumbnail): "
+            f"{format_error_for_log(e)}"
+        )
+
+        return None, "failed"
+
+    # 画像サイズチェック（Bluesky制限: 1MB）
+    image_size = len(response.content)
+
+    if image_size > BSKY_MAX_THUMBNAIL_BYTES:
+        print(
+            f"Thumbnail too large: {image_size} bytes "
+            f"(max {BSKY_MAX_THUMBNAIL_BYTES}), skipping thumbnail"
+        )
+        return None, "too_large"
+
+    return response.content, "ok"
+
+
 def create_external_embed(
     client,
     url,
     ogp,
-    thumbnail_url
+    thumbnail_url,
+    dry_run=False,
+    thumbnail_status_out=None,
 ):
+
+    """
+    OGPカード用のembedを構築する。
+
+    Dry-run時はblob upload（Blueskyへの書き込み操作）を行わない。
+    ただしサムネイルのダウンロードとサイズ検証は通常実行と同じく行い、
+    結果をthumbnail_status_out（list）に報告する。
+
+    thumbnail_status_outが渡された場合、最終ステータス文字列
+    （"ok" / "too_large" / "failed" / "none" / "upload_failed"）を追加する。
+    """
 
     thumb_blob = None
 
-    if thumbnail_url:
+    content, thumb_status = download_thumbnail(
+        thumbnail_url
+    )
 
-        print(
-            f"Downloading thumbnail: "
-            f"{thumbnail_url}"
-        )
+    if content is not None:
 
-        try:
-
-            response = requests.get(
-                thumbnail_url,
-                headers={
-                    "User-Agent": USER_AGENT
-                },
-                timeout=20,
+        if dry_run:
+            print(
+                "[DRY-RUN] Thumbnail valid "
+                f"({len(content)} bytes); "
+                "blob upload skipped"
             )
-
-            response.raise_for_status()
-
-            # 画像サイズチェック（Bluesky制限: 1MB）
-            image_size = len(response.content)
-            if image_size > BSKY_MAX_THUMBNAIL_BYTES:
-                print(
-                    f"Thumbnail too large: {image_size} bytes "
-                    f"(max {BSKY_MAX_THUMBNAIL_BYTES}), skipping thumbnail"
-                )
-                thumbnail_url = None
-            else:
+        else:
+            try:
                 upload = client.upload_blob(
-                    response.content
+                    content
                 )
 
                 thumb_blob = upload.blob
@@ -830,13 +893,18 @@ def create_external_embed(
                     "Thumbnail uploaded."
                 )
 
-        except Exception as e:
+            except Exception as e:
 
-            print(
-                f"Thumbnail processing failed "
-                f"(continuing without thumbnail): "
-                f"{format_error_for_log(e)}"
-            )
+                thumb_status = "upload_failed"
+
+                print(
+                    f"Thumbnail processing failed "
+                    f"(continuing without thumbnail): "
+                    f"{format_error_for_log(e)}"
+                )
+
+    if thumbnail_status_out is not None:
+        thumbnail_status_out.append(thumb_status)
 
     external = (
         models.AppBskyEmbedExternal
@@ -908,7 +976,8 @@ def add_user_to_builder(
 
 def build_post(
     post,
-    users
+    users,
+    dry_run=False,
 ):
 
     author = post.get(
@@ -925,7 +994,8 @@ def build_post(
     # 元投稿者
     author_user = get_x_user(
         author_screen_name,
-        users
+        users,
+        dry_run=dry_run,
     )
 
     builder = (
@@ -1019,7 +1089,8 @@ def build_post(
 
             repost_user = get_x_user(
                 retweeted_by,
-                users
+                users,
+                dry_run=dry_run,
             )
             retweeted_by_user = repost_user
 
@@ -1337,7 +1408,13 @@ def classify_error(e):
     )
 
 
-def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
+def post_with_retry(
+    client,
+    post,
+    users,
+    max_retries=MAX_RETRIES,
+    dry_run=False,
+):
     """
     リトライ付きでBlueskyに投稿する。
 
@@ -1348,6 +1425,9 @@ def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
        次回実行時に再表面化する）
     - TransientError: 指数バックオフで最大max_retries回リトライし、
       尽きたらTransientErrorのままraise（有限回で必ず終了する）
+
+    Dry-run時も分類・リトライ回数は通常実行と同一だが、
+    実際の待機は行わない（テストを高速かつ安全にするため）。
 
     ログにはX post ID・例外型・HTTP status・API error識別子を含める。
     """
@@ -1362,7 +1442,12 @@ def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
     for attempt in range(max_retries + 1):
 
         try:
-            return _post_to_bluesky(client, post, users)
+            return _post_to_bluesky(
+                client,
+                post,
+                users,
+                dry_run=dry_run,
+            )
 
         except Exception as e:
 
@@ -1399,10 +1484,18 @@ def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
                     f"X post ID: {post_id} | "
                     f"{detail}"
                 )
-                print(
-                    f"Retrying in {delay} seconds..."
-                )
-                time.sleep(delay)
+                if dry_run:
+                    # Dry-runでは実際の待機を行わない
+                    # （リトライ経路自体は通常実行と同じ）
+                    print(
+                        f"[DRY-RUN] Would retry in {delay} seconds "
+                        f"(sleep skipped)"
+                    )
+                else:
+                    print(
+                        f"Retrying in {delay} seconds..."
+                    )
+                    time.sleep(delay)
             else:
                 print(
                     f"TRANSIENT ERROR "
@@ -1424,17 +1517,27 @@ def mark_seen(seen, post_id):
     save_seen(seen)
 
 
-def process_single_post(client, post, users, seen):
+def process_single_post(
+    client,
+    post,
+    users,
+    seen,
+    dry_run=False,
+):
     """
     1件のX投稿をBlueskyへ投稿し、結果に応じてseenを更新する。
+
+    Dry-run時はBlueskyへの投稿・seenの更新を一切行わず、
+    「投稿されるはずだった内容」を出力して結果を報告する
+    （"would_post"は実投稿を意味しない）。
 
     戻り値（結果種別）とseenの扱い:
 
     - "success":     投稿成功 → seen登録
+                     （Dry-runでは発生しない）
+    - "would_post":  Dry-runで投稿可能だった → seen変更なし
     - "permanent":   既知の恒久的失敗 → seen登録
-                     （毎回同じ失敗を永久に再処理しないため。
-                      失敗事実はstderrとサマリに可視化され、
-                      黙って消えることはない）
+                     （Dry-runではseen登録をskip）
     - "transient":   一時的失敗（リトライ上限到達含む）→ seen未登録
                      （次回実行時に自動的に再試行される）
     - "unknown":     分類不能な予期しない失敗 → seen未登録
@@ -1446,9 +1549,18 @@ def process_single_post(client, post, users, seen):
     post_id = str(post["id"])
 
     try:
-        response = post_with_retry(client, post, users)
+        response = post_with_retry(
+            client,
+            post,
+            users,
+            dry_run=dry_run,
+        )
 
         if response:
+
+            if dry_run:
+                print_dry_run_result(response)
+                return "would_post"
 
             print(
                 "Posted:"
@@ -1467,9 +1579,15 @@ def process_single_post(client, post, users, seen):
 
     except PermanentError as e:
 
+        seen_note = (
+            "(not marked as seen in dry-run)"
+            if dry_run
+            else "(marked as seen)"
+        )
+
         print(
             f"PERMANENT FAILURE "
-            f"(will not retry; marked as seen): "
+            f"(will not retry; {seen_note}): "
             f"X post ID: {post_id} | "
             f"{format_error_for_log(e)}",
             file=sys.stderr,
@@ -1478,7 +1596,9 @@ def process_single_post(client, post, users, seen):
         # 既知の恒久的失敗は次回も同じ結果になるため
         # seenに追加して毎回の再処理・再通知を防ぐ
         # （失敗事実はstderrログとサマリ計上で可視化される）
-        mark_seen(seen, post_id)
+        # Dry-run時は本番のseen stateを変更しない
+        if not dry_run:
+            mark_seen(seen, post_id)
 
         return "permanent"
 
@@ -1525,15 +1645,130 @@ def validate_post_text(text):
 # Blueskyへ投稿（内部関数）
 # ============================================================
 
+class DryRunResult:
+    """
+    Dry-run時の投稿結果。
+
+    _post_to_blueskyが通常実行ではBluesky APIのレスポンスを返す位置で、
+    Dry-runでは代わりにこのオブジェクトを返す。
+    実際の投稿は存在しないため、uriは擬似的なもの
+    （at://dry-run/...）であり、実投稿と誤認できない形にする。
+    """
+
+    def __init__(
+        self,
+        post,
+        text,
+        grapheme_count,
+        thumbnail_status,
+    ):
+        author = post.get(
+            "author",
+            {}
+        )
+
+        self.post_id = str(post.get("id"))
+
+        self.author_name = (
+            author.get("name")
+            or author.get("screenName")
+            or "Unknown"
+        )
+
+        self.author_screen_name = (
+            author.get("screenName")
+            or ""
+        )
+
+        self.text = text
+        self.grapheme_count = grapheme_count
+        self.thumbnail_status = thumbnail_status
+
+        # 実在しない投稿を示す擬似URI
+        self.uri = f"at://dry-run/x2b/{self.post_id}"
+
+    @property
+    def thumbnail_skipped(self):
+        """サイズ制限超過によりサムネイルが除外されたか。"""
+        return self.thumbnail_status == "too_large"
+
+    @property
+    def has_thumbnail(self):
+        """サイズ検証を通過したサムネイルが存在するか。"""
+        return self.thumbnail_status == "ok"
+
+
+# Dry-run実行中の結果（main()でサマリ集計するために使用）。
+# 通常実行では決して追加されない。
+DRY_RUN_RESULTS = []
+
+
+def print_dry_run_result(result):
+    """
+    Dry-runで「投稿されるはずだった内容」を出力する。
+
+    実際の投稿と誤認できないよう、すべての行に[DRY-RUN]を付ける。
+    認証情報等は含まない（本文・作者・文字数・サムネイル判定のみ）。
+    """
+
+    preview = result.text.replace("\n", " ")
+
+    if count_graphemes(preview) > 60:
+        preview = truncate_text_to_graphemes(
+            preview,
+            60,
+        )
+
+    thumbnail_labels = {
+        "ok": "valid (blob upload skipped)",
+        "too_large": "skipped (exceeds size limit)",
+        "failed": "download failed",
+        "upload_failed": "not attempted (dry-run)",
+        "none": "none",
+    }
+
+    label = thumbnail_labels.get(
+        result.thumbnail_status,
+        result.thumbnail_status,
+    )
+
+    print(
+        f"[DRY-RUN] Would post: X post ID: {result.post_id}"
+    )
+    print(
+        f"[DRY-RUN]   Author: "
+        f"{result.author_name} "
+        f"@{result.author_screen_name}"
+    )
+    print(
+        f"[DRY-RUN]   Text "
+        f"({result.grapheme_count} graphemes): "
+        f"{preview}"
+    )
+    print(
+        f"[DRY-RUN]   Embed: external card | "
+        f"thumbnail: {label}"
+    )
+
+
 def _post_to_bluesky(
     client,
     post,
-    users
+    users,
+    dry_run=False,
 ):
+    """
+    1件のX投稿からBluesky投稿ペイロードを構築し、送信する。
+
+    Dry-run時はbuild/validate/OGP取得/サムネイル検証まで
+    通常実行と同一経路で実行した後、blob uploadとsend_postを
+    行わずDryRunResultを返す（Blueskyへの書き込みは一切発生しない）。
+    """
 
     builder = build_post(
         post,
-        users
+        users,
+        dry_run=dry_run,
     )
 
     text = builder.build_text()
@@ -1573,18 +1808,42 @@ def _post_to_bluesky(
 
     # --------------------------------------------------------
     # OGPカード
+    # （Dry-runでもダウンロード・サイズ検証は行い、
+    #   blob uploadのみskipする）
     # --------------------------------------------------------
+
+    thumbnail_status_out = (
+        [] if dry_run else None
+    )
 
     embed = create_external_embed(
         client,
         x_post_url,
         ogp,
-        thumbnail_url
+        thumbnail_url,
+        dry_run=dry_run,
+        thumbnail_status_out=thumbnail_status_out,
     )
 
     # --------------------------------------------------------
-    # Bluesky投稿
+    # Bluesky投稿（Dry-run時はここでSTOP）
     # --------------------------------------------------------
+
+    if dry_run:
+        result = DryRunResult(
+            post=post,
+            text=text,
+            grapheme_count=count_graphemes(text),
+            thumbnail_status=(
+                thumbnail_status_out[-1]
+                if thumbnail_status_out
+                else "none"
+            ),
+        )
+
+        DRY_RUN_RESULTS.append(result)
+
+        return result
 
     response = client.send_post(
         text=text,
@@ -1599,13 +1858,37 @@ def _post_to_bluesky(
 # メイン
 # ============================================================
 
-def main():
+def parse_args(argv=None):
+    """
+    コマンドライン引数を解析する。
+    """
+    parser = argparse.ArgumentParser(
+        prog="x2b",
+        description=(
+            "Cross-post X list posts to Bluesky."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run the posting pipeline without publishing to Bluesky "
+            "or modifying seen state."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    dry_run = args.dry_run
+
     lock_file = None
-    
+
     try:
         # ロック取得
         lock_file = acquire_lock()
-        
+
         print(
             "=========================================="
         )
@@ -1617,6 +1900,13 @@ def main():
         print(
             f" List ID: {LIST_ID}"
         )
+
+        if dry_run:
+            print(
+                " Mode: DRY-RUN "
+                "(nothing will be published;"
+                " seen state will not change)"
+            )
 
         print(
             "=========================================="
@@ -1724,9 +2014,13 @@ def main():
         # --------------------------------------------------------
 
         success_count = 0
+        would_post_count = 0
         permanent_fail_count = 0
         transient_fail_count = 0
         unknown_fail_count = 0
+
+        # Dry-run結果は実行ごとに集計する
+        DRY_RUN_RESULTS.clear()
 
         for index, post in enumerate(
             new_posts
@@ -1795,11 +2089,14 @@ def main():
                 client,
                 post,
                 users,
-                seen
+                seen,
+                dry_run=dry_run,
             )
 
             if outcome == "success":
                 success_count += 1
+            elif outcome == "would_post":
+                would_post_count += 1
             elif outcome == "permanent":
                 permanent_fail_count += 1
             elif outcome == "transient":
@@ -1809,11 +2106,12 @@ def main():
 
             # ----------------------------------------------------
             # 次の投稿まで3秒
+            # （Dry-runでは実投稿がないため待機しない）
             # ----------------------------------------------------
 
             if (
-                index
-                < len(new_posts) - 1
+                index < len(new_posts) - 1
+                and not dry_run
             ):
 
                 print(
@@ -1826,12 +2124,60 @@ def main():
                 )
 
         print()
-        print(
-            f"Summary: Success: {success_count}, "
-            f"Permanent failures: {permanent_fail_count}, "
-            f"Transient failures: {transient_fail_count}, "
-            f"Unknown failures: {unknown_fail_count}"
-        )
+
+        if dry_run:
+            # Dry-runは「何も投稿していない」ことを
+            # 明確に区別できるサマリで締める
+            thumbnail_skipped = sum(
+                1 for result in DRY_RUN_RESULTS
+                if result.thumbnail_skipped
+            )
+
+            print(
+                "=========================================="
+            )
+            print(
+                " DRY-RUN SUMMARY "
+                "(nothing was published;"
+                " seen.json was not modified)"
+            )
+            print(
+                "=========================================="
+            )
+            print(
+                f"fetched: {len(posts)}"
+            )
+            print(
+                f"skipped_seen: {skipped_seen}"
+            )
+            print(
+                f"skipped_no_id: {skipped_no_id}"
+            )
+            print(
+                f"new: {len(new_posts)}"
+            )
+            print(
+                f"would_post: {would_post_count}"
+            )
+            print(
+                f"permanent_failures: {permanent_fail_count}"
+            )
+            print(
+                f"transient_failures: {transient_fail_count}"
+            )
+            print(
+                f"unknown_failures: {unknown_fail_count}"
+            )
+            print(
+                f"thumbnail_skipped: {thumbnail_skipped}"
+            )
+        else:
+            print(
+                f"Summary: Success: {success_count}, "
+                f"Permanent failures: {permanent_fail_count}, "
+                f"Transient failures: {transient_fail_count}, "
+                f"Unknown failures: {unknown_fail_count}"
+            )
         print(
             "Done."
         )
