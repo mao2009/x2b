@@ -1,7 +1,7 @@
 # ADR 0001: X list取得におけるpaginationの禁止
 
 - Status: Accepted
-- Date: 2026-08-25
+- Date: 2026-08-24 (UTC)
 - Related: Issue #8（過去の二重投稿インシデント調査に関連）
 
 ## Context

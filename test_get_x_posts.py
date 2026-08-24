@@ -53,6 +53,19 @@ def invoked_commands(mock_run):
     return [call.args[0] for call in mock_run.call_args_list]
 
 
+@pytest.fixture(autouse=True)
+def twitter_bin(tmp_path, monkeypatch):
+    """
+    TWITTER_BINを実在ファイルへ差し替える。
+
+    get_x_posts()は実行前にTWITTER_BIN.exists()を確認するため、
+    .venv/bin/twitterが存在しない環境でもテストが成立するようにする。
+    """
+    binary = tmp_path / "twitter"
+    binary.touch()
+    monkeypatch.setattr(x2b, "TWITTER_BIN", binary)
+
+
 @pytest.fixture
 def pipeline_env(tmp_path, monkeypatch):
     """main()を外部依存なしで実行するための最小環境。"""
@@ -119,6 +132,18 @@ class TestSingleFetchPerRun:
 
         with patch(
             "x2b.subprocess.run", return_value=make_cli_result(full_page)
+        ) as mock_run:
+            result = get_x_posts()
+
+        assert mock_run.call_count == 1
+        assert len(result) == MAX_POSTS_PER_RUN
+
+    def test_oversized_response_is_truncated_to_hard_limit(self):
+        # twitter-cliが要求件数を超えて返しても100件をハード上限とする
+        oversized = [make_post(i) for i in range(MAX_POSTS_PER_RUN + 50)]
+
+        with patch(
+            "x2b.subprocess.run", return_value=make_cli_result(oversized)
         ) as mock_run:
             result = get_x_posts()
 

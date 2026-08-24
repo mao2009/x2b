@@ -480,7 +480,9 @@ def get_x_posts():
     if not data.get("ok"):
         raise RuntimeError("twitter-cli returned ok=false")
 
-    posts = data.get("data", [])
+    # twitter-cliが要求件数を超えて返しても
+    # runあたりのハード上限を守る（ADR 0001）
+    posts = data.get("data", [])[:MAX_POSTS_PER_RUN]
 
     print(f"Fetched {len(posts)} posts")
     return posts
