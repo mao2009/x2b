@@ -69,6 +69,12 @@ USER_AGENT = (
 BSKY_MAX_TEXT_GRAPHEMES = 300
 BSKY_MAX_THUMBNAIL_BYTES = 1_000_000
 
+# 本文長マージン（プレフィックス計算などの揺らぎに対する保険）
+TEXT_LENGTH_MARGIN = 10
+
+# 切り詰め時の本文最低保証グラフェム数
+MIN_BODY_GRAPHEMES = 50
+
 
 # ============================================================
 # 環境変数
@@ -154,6 +160,28 @@ def count_graphemes(text):
     if grapheme:
         return grapheme.length(text)
     return len(text)
+
+
+def truncate_text_to_graphemes(text, max_graphemes):
+    """
+    グラフェム単位で本文を切り詰める。
+
+    - 絵文字・結合文字を壊さないようグラフェム単位で処理する
+    - 切り詰め時は末尾を省略記号「…」に置き換える
+      （結果は常にmax_graphemesグラフェム以下）
+    """
+    if max_graphemes <= 0:
+        return ""
+
+    if count_graphemes(text) <= max_graphemes:
+        return text
+
+    keep = max_graphemes - 1
+
+    if grapheme:
+        return grapheme.slice(text, 0, keep) + "…"
+
+    return text[:keep] + "…"
 
 
 # ============================================================
@@ -1020,19 +1048,43 @@ def build_post(
     # プレフィックスのグラフェム数を計算
     prefix_text = build_prefix_text(is_retweet, author_user, retweeted_by_user)
     prefix_length = count_graphemes(prefix_text)
-    
-    # 利用可能な文字数 = 最大 - プレフィックス - 余裕(10)
-    available_length = BSKY_MAX_TEXT_GRAPHEMES - prefix_length - 10
-    
-    if available_length < 50:
-        available_length = 50  # 最小保証
 
-    if count_graphemes(text) > available_length:
-        if grapheme:
-            # グラフェム単位で切り詰め
-            text = grapheme.slice(text, 0, available_length - 1) + "…"
-        else:
-            text = text[:available_length - 1] + "…"
+    # 利用可能な文字数 = 最大 - プレフィックス - 余裕
+    available_length = (
+        BSKY_MAX_TEXT_GRAPHEMES
+        - prefix_length
+        - TEXT_LENGTH_MARGIN
+    )
+
+    if available_length < MIN_BODY_GRAPHEMES:
+        # プレフィックスが極端に長い場合は余裕を削って
+        # 最終本文が300グラフェムを超えないようにする
+        # （通常のプレフィックスではこの分岐に入らない）
+        available_length = BSKY_MAX_TEXT_GRAPHEMES - prefix_length
+
+    if available_length <= 0:
+        raise PermanentError(
+            f"Prefix too long for X post "
+            f"{post.get('id')}: {prefix_length} graphemes "
+            f"(max {BSKY_MAX_TEXT_GRAPHEMES}), cannot build valid post"
+        )
+
+    original_length = count_graphemes(text)
+
+    if original_length > available_length:
+        text = truncate_text_to_graphemes(
+            text,
+            available_length
+        )
+
+        print(
+            f"Text truncated for X post "
+            f"{post.get('id')}: "
+            f"{original_length} -> "
+            f"{count_graphemes(text)} graphemes "
+            f"(prefix: {prefix_length}, "
+            f"limit: {BSKY_MAX_TEXT_GRAPHEMES})"
+        )
 
     add_text_with_facets(
         builder,
@@ -1056,6 +1108,22 @@ class TransientError(Exception):
     pass
 
 
+def validate_post_text(text):
+    """
+    Bluesky API送信前の本文バリデーション。
+
+    既知の制約（300グラフェム制限）を
+    APIに送信する前に検出し、PermanentErrorとして扱う。
+    """
+    length = count_graphemes(text)
+
+    if length > BSKY_MAX_TEXT_GRAPHEMES:
+        raise PermanentError(
+            f"Post text too long: {length} graphemes "
+            f"(max {BSKY_MAX_TEXT_GRAPHEMES})"
+        )
+
+
 def classify_error(e):
     """
     エラーを永続的/一時的に分類。
@@ -1065,6 +1133,16 @@ def classify_error(e):
     - ネットワークエラー: TransientError
     - その他: TransientError（安全側）
     """
+    # 送信前バリデーション等で
+    # 既に分類済みのエラーはそのまま透過させる
+    # （PermanentErrorがTransientErrorに包まれて
+    #   無限リトライされるのを防ぐ）
+    if isinstance(e, PermanentError):
+        return e
+
+    if isinstance(e, TransientError):
+        return e
+
     error_str = str(e)
     
     # atprotoのエラーレスポンスからステータスコードを抽出
@@ -1137,6 +1215,16 @@ def _post_to_bluesky(
         users
     )
 
+    text = builder.build_text()
+
+    # --------------------------------------------------------
+    # 送信前バリデーション
+    # 既知の制約違反はBluesky APIに送る前に検出する
+    # （OGP取得・blobアップロード等の無駄なAPI操作も発生させない）
+    # --------------------------------------------------------
+
+    validate_post_text(text)
+
     x_post_url = get_x_post_url(
         post
     )
@@ -1178,7 +1266,7 @@ def _post_to_bluesky(
     # --------------------------------------------------------
 
     response = client.send_post(
-        text=builder.build_text(),
+        text=text,
         facets=builder.build_facets(),
         embed=embed,
     )
