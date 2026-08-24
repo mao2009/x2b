@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import fcntl
 import json
 import os
 import re
@@ -14,6 +15,11 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from atproto import Client, models, client_utils
 
+try:
+    import grapheme
+except ImportError:
+    grapheme = None
+
 
 # ============================================================
 # 設定
@@ -24,6 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 STATE_FILE = BASE_DIR / "seen.json"
 USERS_FILE = BASE_DIR / "users.json"
+LOCK_FILE = BASE_DIR / ".x2b.lock"
 
 # Bluesky投稿間隔
 POST_INTERVAL = 3
@@ -31,8 +38,22 @@ POST_INTERVAL = 3
 # ユーザー情報キャッシュの更新間隔
 USER_CACHE_DAYS = 7
 
-# Bluesky本文最大文字数
+# Bluesky本文最大文字数（グラフェム数）
+# プレフィックス分を考慮して余裕を持たせる
 MAX_TEXT_LENGTH = 270
+
+# Xリスト取得の最大件数（0で無制限）
+MAX_POSTS_PER_RUN = 200
+
+# twitter-cli 1回あたりの取得件数
+TWITTER_CLI_MAX = 100
+
+# リトライ設定
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 5  # seconds
+
+# ロック取得待機時間
+LOCK_TIMEOUT = 30  # seconds
 
 # cron対策
 TWITTER_BIN = BASE_DIR / ".venv" / "bin" / "twitter"
@@ -43,6 +64,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) "
     "Chrome/120 Safari/537.36"
 )
+
+# Bluesky制限
+BSKY_MAX_TEXT_GRAPHEMES = 300
+BSKY_MAX_THUMBNAIL_BYTES = 1_000_000
 
 
 # ============================================================
@@ -71,6 +96,48 @@ if not LIST_ID:
 
 
 # ============================================================
+# ロック機能
+# ============================================================
+
+def acquire_lock():
+    """
+    ファイルベースのロックを取得。
+    既にロックされている場合は待機する。
+    """
+    lock_file = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another instance is running. Waiting for lock...")
+        start = time.time()
+        while time.time() - start < LOCK_TIMEOUT:
+            time.sleep(1)
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print("Lock acquired.")
+                break
+            except BlockingIOError:
+                continue
+        else:
+            lock_file.close()
+            raise RuntimeError(f"Could not acquire lock within {LOCK_TIMEOUT} seconds")
+    
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
+def release_lock(lock_file):
+    """ロックを解放"""
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+
+
+# ============================================================
 # 共通
 # ============================================================
 
@@ -80,6 +147,13 @@ def now_utc():
 
 def iso_now():
     return now_utc().isoformat()
+
+
+def count_graphemes(text):
+    """グラフェム数をカウント（graphemeライブラリがあれば使用、なければ文字数）"""
+    if grapheme:
+        return grapheme.length(text)
+    return len(text)
 
 
 # ============================================================
@@ -317,7 +391,10 @@ def get_x_user(screen_name, users):
 # ============================================================
 
 def get_x_posts():
-
+    """
+    Xリストから全投稿を取得（ページネーション対応）。
+    twitter-cliは-n/--maxで最大取得件数を指定可能。
+    """
     print("Fetching X list...")
 
     if not TWITTER_BIN.exists():
@@ -327,61 +404,64 @@ def get_x_posts():
 
     env = os.environ.copy()
 
-    result = subprocess.run(
-        [
-            str(TWITTER_BIN),
-            "list",
-            LIST_ID,
-            "--json",
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    all_posts = []
+    max_posts = MAX_POSTS_PER_RUN if MAX_POSTS_PER_RUN > 0 else TWITTER_CLI_MAX * 10
+    remaining = max_posts
 
-    if result.returncode != 0:
+    while remaining > 0:
+        fetch_count = min(TWITTER_CLI_MAX, remaining)
 
-        print(
-            "twitter-cli error:",
-            file=sys.stderr
+        print(f"Fetching page (max {fetch_count} posts)...")
+
+        result = subprocess.run(
+            [
+                str(TWITTER_BIN),
+                "list",
+                LIST_ID,
+                "--json",
+                "-n", str(fetch_count),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
         )
 
-        print(
-            result.stderr,
-            file=sys.stderr
-        )
+        if result.returncode != 0:
+            print(
+                "twitter-cli error:",
+                file=sys.stderr
+            )
+            print(
+                result.stderr,
+                file=sys.stderr
+            )
+            raise RuntimeError("twitter-cli failed")
 
-        raise RuntimeError(
-            "twitter-cli failed"
-        )
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print(result.stdout[:2000], file=sys.stderr)
+            raise
 
-    try:
-        data = json.loads(
-            result.stdout
-        )
+        if not data.get("ok"):
+            raise RuntimeError("twitter-cli returned ok=false")
 
-    except json.JSONDecodeError:
-        print(
-            result.stdout[:2000],
-            file=sys.stderr
-        )
-        raise
+        posts = data.get("data", [])
+        
+        if not posts:
+            print("No more posts.")
+            break
 
-    if not data.get("ok"):
-        raise RuntimeError(
-            "twitter-cli returned ok=false"
-        )
+        all_posts.extend(posts)
+        print(f"Fetched {len(posts)} posts (total: {len(all_posts)})")
 
-    posts = data.get(
-        "data",
-        []
-    )
+        if len(posts) < fetch_count:
+            break
 
-    print(
-        f"Fetched {len(posts)} posts"
-    )
+        remaining -= len(posts)
 
-    return posts
+    print(f"Total fetched: {len(all_posts)} posts")
+    return all_posts
 
 
 # ============================================================
@@ -702,15 +782,24 @@ def create_external_embed(
 
             response.raise_for_status()
 
-            upload = client.upload_blob(
-                response.content
-            )
+            # 画像サイズチェック（Bluesky制限: 1MB）
+            image_size = len(response.content)
+            if image_size > BSKY_MAX_THUMBNAIL_BYTES:
+                print(
+                    f"Thumbnail too large: {image_size} bytes "
+                    f"(max {BSKY_MAX_THUMBNAIL_BYTES}), skipping thumbnail"
+                )
+                thumbnail_url = None
+            else:
+                upload = client.upload_blob(
+                    response.content
+                )
 
-            thumb_blob = upload.blob
+                thumb_blob = upload.blob
 
-            print(
-                "Thumbnail uploaded."
-            )
+                print(
+                    "Thumbnail uploaded."
+                )
 
         except Exception as e:
 
@@ -787,10 +876,6 @@ def add_user_to_builder(
     )
 
 
-# ============================================================
-# 本文生成
-# ============================================================
-
 def build_post(
     post,
     users
@@ -823,9 +908,46 @@ def build_post(
     )
 
     # --------------------------------------------------------
+    # プレフィックス構築（文字数計算用）
+    # --------------------------------------------------------
+    
+    def build_prefix_text(is_retweet, author_user, retweeted_by_user=None):
+        """プレフィックス部分のテキストを構築して返す（グラフェム数計算用）"""
+        temp_builder = client_utils.TextBuilder()
+        if not is_retweet:
+            temp_builder.text("📢 ")
+            name = author_user.get("name") or author_user.get("screenName") or "Unknown"
+            screen_name = author_user.get("screenName") or ""
+            temp_builder.text(name)
+            if screen_name:
+                temp_builder.text(" ")
+                temp_builder.text(f"@{screen_name}")
+            temp_builder.text("（X）")
+        else:
+            temp_builder.text("🔁 リポスト")
+            temp_builder.text("\n\n元投稿：")
+            name = author_user.get("name") or author_user.get("screenName") or "Unknown"
+            screen_name = author_user.get("screenName") or ""
+            temp_builder.text(name)
+            if screen_name:
+                temp_builder.text(" ")
+                temp_builder.text(f"@{screen_name}")
+            if retweeted_by_user:
+                temp_builder.text("\nリポスト：")
+                name = retweeted_by_user.get("name") or retweeted_by_user.get("screenName") or "Unknown"
+                screen_name = retweeted_by_user.get("screenName") or ""
+                temp_builder.text(name)
+                if screen_name:
+                    temp_builder.text(" ")
+                    temp_builder.text(f"@{screen_name}")
+        temp_builder.text("\n\n")
+        return temp_builder.build_text()
+
+    # --------------------------------------------------------
     # 通常投稿
     # --------------------------------------------------------
 
+    retweeted_by_user = None
     if not is_retweet:
 
         builder.text(
@@ -869,6 +991,7 @@ def build_post(
                 retweeted_by,
                 users
             )
+            retweeted_by_user = repost_user
 
             builder.text(
                 "\nリポスト："
@@ -884,7 +1007,7 @@ def build_post(
     )
 
     # --------------------------------------------------------
-    # X本文
+    # X本文（プレフィックス長を考慮して切り詰め）
     # --------------------------------------------------------
 
     text = (
@@ -894,14 +1017,22 @@ def build_post(
         or ""
     ).strip()
 
-    if len(text) > MAX_TEXT_LENGTH:
+    # プレフィックスのグラフェム数を計算
+    prefix_text = build_prefix_text(is_retweet, author_user, retweeted_by_user)
+    prefix_length = count_graphemes(prefix_text)
+    
+    # 利用可能な文字数 = 最大 - プレフィックス - 余裕(10)
+    available_length = BSKY_MAX_TEXT_GRAPHEMES - prefix_length - 10
+    
+    if available_length < 50:
+        available_length = 50  # 最小保証
 
-        text = (
-            text[
-                :MAX_TEXT_LENGTH - 1
-            ]
-            + "…"
-        )
+    if count_graphemes(text) > available_length:
+        if grapheme:
+            # グラフェム単位で切り詰め
+            text = grapheme.slice(text, 0, available_length - 1) + "…"
+        else:
+            text = text[:available_length - 1] + "…"
 
     add_text_with_facets(
         builder,
@@ -912,10 +1043,90 @@ def build_post(
 
 
 # ============================================================
-# Blueskyへ投稿
+# エラー分類とリトライ
 # ============================================================
 
-def post_to_bluesky(
+class PermanentError(Exception):
+    """永続的なエラー（リトライしても解決しない）"""
+    pass
+
+
+class TransientError(Exception):
+    """一時的なエラー（リトライで解決する可能性がある）"""
+    pass
+
+
+def classify_error(e):
+    """
+    エラーを永続的/一時的に分類。
+    - 400: PermanentError（不正なリクエスト）
+    - 429: TransientError（レートリミット）
+    - 5xx: TransientError（サーバーエラー）
+    - ネットワークエラー: TransientError
+    - その他: TransientError（安全側）
+    """
+    error_str = str(e)
+    
+    # atprotoのエラーレスポンスからステータスコードを抽出
+    if "status_code=400" in error_str or "status_code=400" in error_str:
+        return PermanentError(f"Bad request (400): {e}")
+    
+    if "status_code=429" in error_str:
+        return TransientError(f"Rate limited (429): {e}")
+    
+    if "status_code=5" in error_str and len(error_str.split("status_code=")) > 1:
+        try:
+            code_part = error_str.split("status_code=")[1]
+            status_code = int(code_part[:3])
+            if 500 <= status_code < 600:
+                return TransientError(f"Server error ({status_code}): {e}")
+        except (ValueError, IndexError):
+            pass
+    
+    # ネットワーク系エラー
+    if isinstance(e, (requests.RequestException, ConnectionError, TimeoutError)):
+        return TransientError(f"Network error: {e}")
+    
+    # その他は一時的エラーとして扱う（安全側）
+    return TransientError(f"Unknown error: {e}")
+
+
+def post_with_retry(client, post, users, max_retries=MAX_RETRIES):
+    """
+    リトライ付きでBlueskyに投稿。
+    一時的エラーは指数バックオフでリトライ。
+    永続的エラーは即座にraise。
+    """
+    last_error = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            return _post_to_bluesky(client, post, users)
+        except Exception as e:
+            classified = classify_error(e)
+            
+            if isinstance(classified, PermanentError):
+                print(f"PERMANENT ERROR (not retrying): {classified}")
+                raise classified
+            
+            last_error = classified
+            
+            if attempt < max_retries:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)  # 指数バックオフ
+                print(f"TRANSIENT ERROR (attempt {attempt + 1}/{max_retries + 1}): {classified}")
+                print(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                print(f"TRANSIENT ERROR (max retries exceeded): {classified}")
+    
+    raise last_error
+
+
+# ============================================================
+# Blueskyへ投稿（内部関数）
+# ============================================================
+
+def _post_to_bluesky(
     client,
     post,
     users
@@ -980,241 +1191,276 @@ def post_to_bluesky(
 # ============================================================
 
 def main():
-
-    print(
-        "=========================================="
-    )
-
-    print(
-        " X List → Bluesky"
-    )
-
-    print(
-        f" List ID: {LIST_ID}"
-    )
-
-    print(
-        "=========================================="
-    )
-
-    # --------------------------------------------------------
-    # Blueskyログイン
-    # --------------------------------------------------------
-
-    print(
-        "Logging into Bluesky..."
-    )
-
-    client = Client()
-
-    client.login(
-        BSKY_HANDLE,
-        BSKY_APP_PASSWORD
-    )
-
-    print(
-        "Bluesky login: OK"
-    )
-
-    # --------------------------------------------------------
-    # ユーザーキャッシュ
-    # --------------------------------------------------------
-
-    users = load_users()
-
-    # --------------------------------------------------------
-    # X取得
-    # --------------------------------------------------------
-
-    posts = get_x_posts()
-
-    # --------------------------------------------------------
-    # リポストも含める
-    # --------------------------------------------------------
-
-    print(
-        "Retweets are included."
-    )
-
-    # --------------------------------------------------------
-    # 古い順
-    # --------------------------------------------------------
-
-    posts.sort(
-        key=lambda post:
-        post.get(
-            "createdAtISO",
-            ""
+    lock_file = None
+    
+    try:
+        # ロック取得
+        lock_file = acquire_lock()
+        
+        print(
+            "=========================================="
         )
-    )
 
-    # --------------------------------------------------------
-    # 投稿済み確認
-    # --------------------------------------------------------
+        print(
+            " X List → Bluesky"
+        )
 
-    seen = load_seen()
+        print(
+            f" List ID: {LIST_ID}"
+        )
 
-    new_posts = []
+        print(
+            "=========================================="
+        )
 
-    for post in posts:
+        # --------------------------------------------------------
+        # Blueskyログイン
+        # --------------------------------------------------------
 
-        post_id = str(
+        print(
+            "Logging into Bluesky..."
+        )
+
+        client = Client()
+
+        client.login(
+            BSKY_HANDLE,
+            BSKY_APP_PASSWORD
+        )
+
+        print(
+            "Bluesky login: OK"
+        )
+
+        # --------------------------------------------------------
+        # ユーザーキャッシュ
+        # --------------------------------------------------------
+
+        users = load_users()
+
+        # --------------------------------------------------------
+        # X取得
+        # --------------------------------------------------------
+
+        posts = get_x_posts()
+
+        # --------------------------------------------------------
+        # リポストも含める
+        # --------------------------------------------------------
+
+        print(
+            "Retweets are included."
+        )
+
+        # --------------------------------------------------------
+        # 古い順
+        # --------------------------------------------------------
+
+        posts.sort(
+            key=lambda post:
             post.get(
-                "id",
+                "createdAtISO",
                 ""
             )
         )
 
-        if not post_id:
-            continue
+        # --------------------------------------------------------
+        # 投稿済み確認
+        # --------------------------------------------------------
 
-        if post_id in seen:
-            continue
+        seen = load_seen()
 
-        new_posts.append(
-            post
-        )
+        new_posts = []
+        skipped_seen = 0
+        skipped_no_id = 0
 
-    print(
-        f"New posts: "
-        f"{len(new_posts)}"
-    )
+        for post in posts:
 
-    if not new_posts:
+            post_id = str(
+                post.get(
+                    "id",
+                    ""
+                )
+            )
+
+            if not post_id:
+                skipped_no_id += 1
+                continue
+
+            if post_id in seen:
+                skipped_seen += 1
+                continue
+
+            new_posts.append(
+                post
+            )
 
         print(
-            "Nothing to post."
+            f"Fetched: {len(posts)}, "
+            f"Skipped (seen): {skipped_seen}, "
+            f"Skipped (no ID): {skipped_no_id}, "
+            f"New: {len(new_posts)}"
         )
 
-        return
+        if not new_posts:
 
-    # --------------------------------------------------------
-    # 投稿
-    # --------------------------------------------------------
-
-    for index, post in enumerate(
-        new_posts
-    ):
-
-        post_id = str(
-            post["id"]
-        )
-
-        author = post.get(
-            "author",
-            {}
-        )
-
-        screen_name = (
-            author.get(
-                "screenName",
-                "unknown"
+            print(
+                "Nothing to post."
             )
-        )
 
-        name = (
-            author.get(
-                "name",
-                "unknown"
+            return
+
+        # --------------------------------------------------------
+        # 投稿
+        # --------------------------------------------------------
+
+        success_count = 0
+        permanent_fail_count = 0
+        transient_fail_count = 0
+
+        for index, post in enumerate(
+            new_posts
+        ):
+
+            post_id = str(
+                post["id"]
             )
-        )
 
-        is_retweet = post.get(
-            "isRetweet",
-            False
-        )
+            author = post.get(
+                "author",
+                {}
+            )
+
+            screen_name = (
+                author.get(
+                    "screenName",
+                    "unknown"
+                )
+            )
+
+            name = (
+                author.get(
+                    "name",
+                    "unknown"
+                )
+            )
+
+            is_retweet = post.get(
+                "isRetweet",
+                False
+            )
+
+            print()
+            print(
+                f"[{index + 1}/"
+                f"{len(new_posts)}]"
+            )
+
+            if is_retweet:
+
+                print(
+                    f"RETWEET: "
+                    f"{name} "
+                    f"@{screen_name}"
+                )
+
+                print(
+                    "retweetedBy: "
+                    f"{post.get('retweetedBy', '')}"
+                )
+
+            else:
+
+                print(
+                    f"POST: "
+                    f"{name} "
+                    f"@{screen_name}"
+                )
+
+            print(
+                f"X post ID: {post_id}"
+            )
+
+            try:
+
+                response = post_with_retry(
+                    client,
+                    post,
+                    users
+                )
+
+                if response:
+
+                    print(
+                        "Posted:"
+                    )
+
+                    print(
+                        response.uri
+                    )
+
+                    # 成功した場合のみ既読
+                    seen.add(
+                        post_id
+                    )
+
+                    save_seen(
+                        seen
+                    )
+                    success_count += 1
+
+            except PermanentError as e:
+
+                print(
+                    f"PERMANENT FAILURE (will not retry): {e}",
+                    file=sys.stderr
+                )
+                permanent_fail_count += 1
+                # 永続的エラーの場合はseenに追加して次回スキップ
+                # （同じエラーで永遠にリトライしないため）
+                seen.add(post_id)
+                save_seen(seen)
+
+            except TransientError as e:
+
+                print(
+                    f"TRANSIENT FAILURE (will retry next run): {e}",
+                    file=sys.stderr
+                )
+                transient_fail_count += 1
+                # 一時的エラーはseenに入れない（次回リトライ）
+
+            # ----------------------------------------------------
+            # 次の投稿まで3秒
+            # ----------------------------------------------------
+
+            if (
+                index
+                < len(new_posts) - 1
+            ):
+
+                print(
+                    f"Waiting "
+                    f"{POST_INTERVAL} seconds..."
+                )
+
+                time.sleep(
+                    POST_INTERVAL
+                )
 
         print()
         print(
-            f"[{index + 1}/"
-            f"{len(new_posts)}]"
+            f"Summary: Success: {success_count}, "
+            f"Permanent failures: {permanent_fail_count}, "
+            f"Transient failures: {transient_fail_count}"
         )
-
-        if is_retweet:
-
-            print(
-                f"RETWEET: "
-                f"{name} "
-                f"@{screen_name}"
-            )
-
-            print(
-                "retweetedBy: "
-                f"{post.get('retweetedBy', '')}"
-            )
-
-        else:
-
-            print(
-                f"POST: "
-                f"{name} "
-                f"@{screen_name}"
-            )
-
         print(
-            f"X post ID: {post_id}"
+            "Done."
         )
-
-        try:
-
-            response = post_to_bluesky(
-                client,
-                post,
-                users
-            )
-
-            if response:
-
-                print(
-                    "Posted:"
-                )
-
-                print(
-                    response.uri
-                )
-
-                # 成功した場合のみ既読
-                seen.add(
-                    post_id
-                )
-
-                save_seen(
-                    seen
-                )
-
-        except Exception as e:
-
-            print(
-                f"POST ERROR: {e}",
-                file=sys.stderr
-            )
-
-            # 失敗した投稿は
-            # seenに入れない。
-            # 次回実行時に再試行する。
-
-        # ----------------------------------------------------
-        # 次の投稿まで3秒
-        # ----------------------------------------------------
-
-        if (
-            index
-            < len(new_posts) - 1
-        ):
-
-            print(
-                f"Waiting "
-                f"{POST_INTERVAL} seconds..."
-            )
-
-            time.sleep(
-                POST_INTERVAL
-            )
-
-    print()
-    print(
-        "Done."
-    )
+    
+    finally:
+        if lock_file:
+            release_lock(lock_file)
 
 
 # ============================================================
