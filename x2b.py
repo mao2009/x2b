@@ -9,13 +9,15 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 
 import requests
+from atproto import Client, client_utils, models
+from atproto_client import exceptions as atproto_exceptions
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from atproto import Client, models, client_utils
-from atproto_client import exceptions as atproto_exceptions
+from PIL import Image
 
 try:
     import grapheme
@@ -778,14 +780,94 @@ def add_text_with_facets(
 # Bluesky用OGPカード
 # ============================================================
 
+def _resize_image_to_limit(content, max_bytes):
+    """
+    画像をBlueskyのサイズ制限以下にリサイズ・再エンコードする。
+
+    処理手順:
+    1. 既に制限以下ならそのまま返す（再エンコードしない）
+    2. JPEG品質を段階的に下げてサイズ確認
+    3. 品質だけでは収まらない場合は寸法を縮小
+    4. 最終的なpayloadサイズを実測して確認
+
+    戻り値は (resized_content, actual_size) のタプル。
+    サイズ制限を満たせない場合は (None, original_size)。
+    """
+    original_size = len(content)
+
+    if original_size <= max_bytes:
+        return content, original_size
+
+    try:
+        img = Image.open(BytesIO(content))
+    except Exception as e:
+        print(
+            f"Image decode failed during resize: "
+            f"{format_error_for_log(e)}"
+        )
+        return None, original_size
+
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    # --- Phase 1: JPEG品質を段階的に下げてサイズ確認 ---
+    for quality in (85, 75, 60, 45, 30):
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        size = buf.tell()
+        if size <= max_bytes:
+            print(
+                f"Image resized: JPEG quality={quality}, "
+                f"{size} bytes (limit: {max_bytes})"
+            )
+            return buf.getvalue(), size
+
+    # --- Phase 2: 寸法を段階的に縮小 ---
+    w, h = img.size
+    for scale in (0.75, 0.5, 0.375, 0.25):
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = img.resize((new_w, new_h), Image.LANCZOS)
+        buf = BytesIO()
+        resized.save(buf, format="JPEG", quality=60, optimize=True)
+        size = buf.tell()
+        if size <= max_bytes:
+            print(
+                f"Image resized: {new_w}x{new_h} "
+                f"(from {w}x{h}), JPEG quality=60, "
+                f"{size} bytes (limit: {max_bytes})"
+            )
+            return buf.getvalue(), size
+
+    # --- 全ての試行が失敗 ---
+    smallest_buf = BytesIO()
+    smallest = img.resize(
+        (max(1, int(w * 0.25)), max(1, int(h * 0.25))),
+        Image.LANCZOS,
+    )
+    smallest.save(smallest_buf, format="JPEG", quality=30, optimize=True)
+    final_size = smallest_buf.tell()
+
+    print(
+        f"Image too large even after resize: "
+        f"{final_size} bytes "
+        f"(limit: {max_bytes}), "
+        f"skipping thumbnail"
+    )
+    return None, final_size
+
+
 def download_thumbnail(thumbnail_url):
     """
     サムネイル画像をダウンロードし、Blueskyのサイズ制限を検証する。
 
+    サイズ超過時はリサイズ・再エンコードを試み、
+    最終payloadサイズを実測して確認する。
+
     戻り値は (content, status) のタプル:
 
     - content: 画像bytes（取得できない場合はNone）
-    - status:  "ok" | "too_large" | "failed" | "none"
+    - status:  "ok" | "resized" | "too_large" | "failed" | "none"
 
     サイズ超過・取得失敗時も例外を上げない
     （サムネイルなしで投稿を継続する既存ポリシー）。
@@ -829,8 +911,18 @@ def download_thumbnail(thumbnail_url):
     if image_size > BSKY_MAX_THUMBNAIL_BYTES:
         print(
             f"Thumbnail too large: {image_size} bytes "
-            f"(max {BSKY_MAX_THUMBNAIL_BYTES}), skipping thumbnail"
+            f"(max {BSKY_MAX_THUMBNAIL_BYTES}), "
+            f"attempting resize..."
         )
+
+        resized, _final_size = _resize_image_to_limit(
+            response.content,
+            BSKY_MAX_THUMBNAIL_BYTES,
+        )
+
+        if resized is not None:
+            return resized, "resized"
+
         return None, "too_large"
 
     return response.content, "ok"
@@ -865,9 +957,10 @@ def create_external_embed(
     if content is not None:
 
         if dry_run:
+            status_label = thumb_status
             print(
-                "[DRY-RUN] Thumbnail valid "
-                f"({len(content)} bytes); "
+                f"[DRY-RUN] Thumbnail valid "
+                f"({len(content)} bytes, status={status_label}); "
                 "blob upload skipped"
             )
         else:
@@ -1682,9 +1775,14 @@ class DryRunResult:
         return self.thumbnail_status == "too_large"
 
     @property
+    def thumbnail_resized(self):
+        """リサイズによりサイズ制限内に収まったか。"""
+        return self.thumbnail_status == "resized"
+
+    @property
     def has_thumbnail(self):
         """サイズ検証を通過したサムネイルが存在するか。"""
-        return self.thumbnail_status == "ok"
+        return self.thumbnail_status in ("ok", "resized")
 
 
 # Dry-run実行中の結果（main()でサマリ集計するために使用）。
@@ -1710,6 +1808,7 @@ def print_dry_run_result(result):
 
     thumbnail_labels = {
         "ok": "valid (blob upload skipped)",
+        "resized": "resized (blob upload skipped)",
         "too_large": "skipped (exceeds size limit)",
         "failed": "download failed",
         "upload_failed": "not attempted (dry-run)",
@@ -2121,6 +2220,10 @@ def main(argv=None):
                 1 for result in DRY_RUN_RESULTS
                 if result.thumbnail_skipped
             )
+            thumbnail_resized = sum(
+                1 for result in DRY_RUN_RESULTS
+                if result.thumbnail_resized
+            )
 
             print(
                 "=========================================="
@@ -2159,6 +2262,9 @@ def main(argv=None):
             )
             print(
                 f"thumbnail_skipped: {thumbnail_skipped}"
+            )
+            print(
+                f"thumbnail_resized: {thumbnail_resized}"
             )
         else:
             print(

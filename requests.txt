@@ -1,6 +1,7 @@
 atproto
 beautifulsoup4
 grapheme
+Pillow
 python-dotenv
 requests
 twitter-cli
